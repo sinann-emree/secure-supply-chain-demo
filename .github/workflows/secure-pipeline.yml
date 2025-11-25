@@ -1,0 +1,142 @@
+name: Secure Supply Chain Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}-backend
+
+jobs:
+  # --- AŞAMA 1: TESTLER ---
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      # Backend Test
+      - name: Setup Node (Backend)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install & Test Backend
+        working-directory: ./server
+        run: |
+          npm ci
+          npm run test
+
+      # Frontend & Erişilebilirlik Testi
+      - name: Setup Node (Frontend)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install & Test Frontend (Playwright + Axe)
+        working-directory: ./client
+        run: |
+          npm ci
+          npx playwright install --with-deps
+          # Frontend'i test için geçici olarak başlat
+          npm run dev & 
+          npx playwright test
+
+  # --- AŞAMA 2: GÜVENLİ BUILD, SCAN & SIGN (BACKEND) ---
+  build-secure-push:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write       
+      id-token: write       # Cosign Keyless imzalama için zorunlu
+      security-events: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Image Build
+      - name: Build and export Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./server
+          push: false
+          load: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      # GÜVENLİK 1: TRIVY SCAN
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}'
+          format: 'table'
+          exit-code: '1'      # Kritik açık varsa pipeline dursun!
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      # GÜVENLİK 2: SBOM OLUŞTURMA (SYFT)
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+      
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+
+      # PUSH
+      - name: Push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./server
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      # GÜVENLİK 3: COSIGN İMZALAMA
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.3.0
+
+      - name: Sign the images with GitHub OIDC Token
+        env:
+          DIGEST: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        run: |
+          cosign sign --yes ${DIGEST}
+
+  # --- AŞAMA 3: DEPLOY FRONTEND ---
+  deploy-frontend:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install & Build
+        working-directory: ./client
+        run: |
+          npm ci
+          npm run build
+      
+      - name: Deploy to Netlify
+        uses: nwtgck/actions-netlify@v2.0
+        with:
+          publish-dir: './client/dist'
+          production-branch: main
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          deploy-message: "Deploy from GitHub Actions"
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
